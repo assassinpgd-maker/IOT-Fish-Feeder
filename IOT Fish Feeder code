@@ -1,0 +1,431 @@
+#define BLYNK_TEMPLATE_ID  "TMPL6OgX_rNoQ"
+#define BLYNK_TEMPLATE_NAME "IOT PET FEEDER"
+#define BLYNK_AUTH_TOKEN "P09zy7702aHtVGO779yTIE9wSddxcwm7"
+
+#include "DurianBlynkESP8266.h"
+#include <SoftwareSerial.h>
+SoftwareSerial EspSerial(2, 3); // RX, TX
+#include <LiquidCrystal_I2C.h>
+#include <Servo.h> // Include Servo library
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Servo feederServo; // Create Servo object
+
+//ESP8266 baud rate default 9600
+#define ESP8266_BAUD 9600
+#define OFF   0
+#define ON    1
+
+// --- PIN DEFINITIONS ---
+// Servo Pin (Safe Pin 12, away from Durian motor drivers)
+#define SERVO_PIN 12
+
+// Sensor Pins
+#define IR_SENSOR_PIN A0
+#define TRIG_PIN 5
+#define ECHO_PIN 6
+#define BUZZER 4
+
+// Physical Button Pins (Offline Control Panel)
+#define BTN_MANUAL_FEED 11
+#define BTN_SET_HOUR A1
+#define BTN_SET_MINUTE A2
+#define BTN_SET_PORTION A3
+#define BTN_CLEAR_ERROR 7
+#define BTN_RESET_TIMER 8 // Quick Undo/Reset Timer
+
+// Blynk Virtual Pins
+#define FOOD_AMOUNT_ADJUSTOR    V0
+#define V_FEEDER_CONTROL        V1
+#define V_FOOD_LEVEL            V2
+#define V_HOUR                  V3
+#define V_MINUTE                V4
+
+// Widget Colors 
+#define BLYNK_GREEN     "#23C48E"
+#define BLYNK_RED       "#D3435C"
+
+char auth[] = BLYNK_AUTH_TOKEN;
+
+#ifdef BLYNK_TEMPLATE_ID && BLYNK_TEMPLATE_NAME
+char tempID[] = BLYNK_TEMPLATE_ID; 
+char deviceName[] = BLYNK_TEMPLATE_NAME; 
+#else
+char tempID[5]; 
+char deviceName[5]; 
+#endif
+
+// Your WiFi credentials.
+char ssid[] = "Galaxy A35 5G D0EE";
+char pass[] = "brrbrrpatapim";
+
+//esp8266 serial
+DBlynk DBlynk(&EspSerial);
+
+unsigned short gusIsON_Motor_Bef = 0;
+unsigned short gusIsSend_Noti_Bef = 0;
+unsigned long gulStart_LCD_Timer = 0;
+
+long glTimerSlot_Hour = -1;
+long glTimerSlot_Minute = -1;
+
+// Global Error Flag
+bool gbIsJammed = false; 
+int rawPortionSize = 10; // Default portion value for the app
+
+void setup() 
+{
+  Serial.begin(9600);
+
+  // Setup Sensors
+  pinMode(IR_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  // Setup Physical Buttons (Using internal pullup resistors)
+  pinMode(BTN_MANUAL_FEED, INPUT_PULLUP);
+  pinMode(BTN_SET_HOUR, INPUT_PULLUP);
+  pinMode(BTN_SET_MINUTE, INPUT_PULLUP);
+  pinMode(BTN_SET_PORTION, INPUT_PULLUP);
+  pinMode(BTN_CLEAR_ERROR, INPUT_PULLUP);
+  pinMode(BTN_RESET_TIMER, INPUT_PULLUP);
+
+  // Initial Servo Setup using the Detach Method
+  feederServo.attach(SERVO_PIN);
+  feederServo.writeMicroseconds(1500); // Send stop command
+  delay(100);                          // Give it 100ms to register
+  feederServo.detach();                // KILL THE SIGNAL to prevent Wi-Fi jitter
+
+  lcd.init();
+  lcd.backlight();
+  lcd.print("Wifi Connect...");
+
+  tone(BUZZER, 1000); delay(300);
+  tone(BUZZER, 500); delay(300);
+  noTone(BUZZER);
+
+  EspSerial.begin(ESP8266_BAUD);
+  delay(10);
+  DBlynk.begin(tempID, deviceName, auth, ssid, pass);
+
+  tone(BUZZER, 500); delay(300);
+  tone(BUZZER, 1000); delay(300);
+  noTone(BUZZER);
+
+  lcd.setCursor(0,1);
+  lcd.print("Done!");
+
+  // Initialize App Values
+  DBlynk.virtualWrite(V_HOUR, -1);
+  DBlynk.virtualWrite(V_MINUTE, -1);
+  DBlynk.virtualWrite(V_FEEDER_CONTROL, 0);
+  DBlynk.virtualWrite(V_FOOD_LEVEL, 100); 
+  DBlynk.setProperty(V_FOOD_LEVEL, "color", BLYNK_GREEN);
+  DBlynk.setProperty(V_FEEDER_CONTROL, "color", BLYNK_GREEN);
+  DBlynk.setProperty(FOOD_AMOUNT_ADJUSTOR, "color", BLYNK_GREEN);
+  DBlynk.virtualWrite(FOOD_AMOUNT_ADJUSTOR, rawPortionSize);
+  
+  delay(1000);
+  gulStart_LCD_Timer = millis();
+}
+
+void loop() 
+{
+  unsigned long ulHour = DBlynk.hour(); 
+  unsigned long ulMin = DBlynk.minute(); 
+  unsigned long ulSec = DBlynk.second(); 
+  static long lSetTime = -1;  
+  unsigned long ulRealTime = 0;  
+  unsigned short usIsBut_ON = 0;
+  unsigned short usFood_Drop_Time = 0; 
+ 
+  DBlynk.run();
+
+  // Read app values
+  rawPortionSize = DBlynk.read_asInt(FOOD_AMOUNT_ADJUSTOR);
+  glTimerSlot_Hour = DBlynk.read_asDouble(V_HOUR);
+  glTimerSlot_Minute = DBlynk.read_asDouble(V_MINUTE);
+
+  // --- 1. PHYSICAL BUTTON LOGIC ---
+  
+  // Button 1: Manual Feed
+  if(digitalRead(BTN_MANUAL_FEED) == LOW && !gbIsJammed) {
+    lcd.clear(); lcd.print("Manual Feed!");
+    usFood_Drop_Time = map(rawPortionSize, 10, 100, 1000, 10000);
+    vSmartFeed(usFood_Drop_Time, false);
+    delay(500); // Debounce
+  }
+
+  // Button 2: Set Hour (+)
+  if(digitalRead(BTN_SET_HOUR) == LOW) {
+    // If it was OFF, turn it ON and auto-set Minute to 00 so the screen updates instantly
+    if(glTimerSlot_Hour < 0) {
+      glTimerSlot_Hour = 0; 
+      if(glTimerSlot_Minute < 0) glTimerSlot_Minute = 0; 
+    }
+    else {
+      glTimerSlot_Hour++;
+    }
+    
+    // Loop back to OFF
+    if(glTimerSlot_Hour > 23) {
+      glTimerSlot_Hour = -1; 
+      glTimerSlot_Minute = -1; 
+    }
+    
+    DBlynk.virtualWrite(V_HOUR, glTimerSlot_Hour); 
+    DBlynk.virtualWrite(V_MINUTE, glTimerSlot_Minute); 
+    
+    delay(300); // Debounce to prevent double-clicks
+  }
+
+  // Button 3: Set Minute (+)
+  if(digitalRead(BTN_SET_MINUTE) == LOW) {
+    // If it was OFF, turn it ON and auto-set Hour to 00 so the screen updates instantly
+    if(glTimerSlot_Minute < 0) {
+      glTimerSlot_Minute = 0; 
+      if(glTimerSlot_Hour < 0) glTimerSlot_Hour = 0; 
+    }
+    else {
+      glTimerSlot_Minute++;
+    }
+    
+    if(glTimerSlot_Minute > 59) glTimerSlot_Minute = 0; // Minutes loop back to 0
+    
+    DBlynk.virtualWrite(V_MINUTE, glTimerSlot_Minute); 
+    DBlynk.virtualWrite(V_HOUR, glTimerSlot_Hour); 
+    
+    delay(300); // Debounce to prevent double-clicks
+  }
+
+  // Button 4: Set Portion Size (+)
+  if(digitalRead(BTN_SET_PORTION) == LOW) {
+    rawPortionSize += 10;
+    if(rawPortionSize > 100) rawPortionSize = 10;
+    DBlynk.virtualWrite(FOOD_AMOUNT_ADJUSTOR, rawPortionSize); 
+    
+    // Clear screen, show portion clearly, and pause for 1 second so you can read it!
+    lcd.clear(); 
+    lcd.setCursor(0,0); lcd.print("Portion Size:"); 
+    lcd.setCursor(0,1); lcd.print(rawPortionSize); lcd.print("%");
+    delay(1000); 
+  }
+
+  // Button 5: Clear Error (Un-Jam Reset)
+  if(digitalRead(BTN_CLEAR_ERROR) == LOW) {
+    if(gbIsJammed) {
+      gbIsJammed = false; // Reset the error flag
+      lcd.clear();
+      lcd.print("Error Cleared!");
+      delay(1000);
+    }
+  }
+
+  // Button 6: Reset Timer (Quick Undo)
+  if(digitalRead(BTN_RESET_TIMER) == LOW) {
+    glTimerSlot_Hour = -1;
+    glTimerSlot_Minute = -1;
+    DBlynk.virtualWrite(V_HOUR, -1);   // Reset on Blynk App
+    DBlynk.virtualWrite(V_MINUTE, -1); // Reset on Blynk App
+    
+    lcd.clear();
+    lcd.print("Timer Reset!");
+    delay(750); // Debounce & let user read the message
+  }
+
+
+  // --- 2. AUTOMATED TIMERS & APP FEEDING LOGIC ---
+
+  // Calculate Portion Time for automated feeding
+  if (rawPortionSize < 10) rawPortionSize = 20; 
+  usFood_Drop_Time = map(rawPortionSize, 10, 100, 1000, 10000);
+
+  // Scheduled Timer Logic
+  if(glTimerSlot_Hour >= 0 && glTimerSlot_Minute >= 0) {
+    lSetTime = glTimerSlot_Hour*60*60 + glTimerSlot_Minute*60;
+  } else {
+    lSetTime = -1;
+  }
+
+  ulRealTime = ulHour*60*60 + ulMin*60 + ulSec; 
+
+  if(lSetTime >= 0 && !gbIsJammed) {
+    if(ulRealTime == lSetTime) {  
+      DBlynk.logEvent("notification", "Start Feeding...");
+      vSmartFeed(usFood_Drop_Time, false); 
+    }      
+  }
+
+  // App Manual Feed Button Logic
+  usIsBut_ON = DBlynk.read_asInt(V_FEEDER_CONTROL);
+  if(usIsBut_ON == 1 && !gbIsJammed) {
+    vSmartFeed(usFood_Drop_Time, true); 
+    DBlynk.virtualWrite(V_FEEDER_CONTROL, 0); 
+  } else if (usIsBut_ON == 1 && gbIsJammed) {
+    // If user presses App button while jammed, turn button off automatically
+    DBlynk.virtualWrite(V_FEEDER_CONTROL, 0); 
+  }
+
+
+  // --- 3. SCREEN AND SENSOR UPDATES ---
+  if(millis() - gulStart_LCD_Timer >= 300)
+  {
+    int foodPercentage = iGet_Food_Level();
+    DBlynk.virtualWrite(V_FOOD_LEVEL, foodPercentage);
+
+    if (gbIsJammed) {
+      lcd.clear();
+      lcd.setCursor(0,0); lcd.print("ERROR: STUCK!");
+      lcd.setCursor(0,1); lcd.print("Press Btn 5!"); // Tells user how to clear!
+    } else {
+      vLCD_Disp_Set_Time(glTimerSlot_Hour, glTimerSlot_Minute, ulHour, ulMin, ulSec, foodPercentage);
+    }
+    
+    if(foodPercentage <= 15) {
+      if(gusIsSend_Noti_Bef == 0) {
+        DBlynk.setProperty(V_FOOD_LEVEL, "color", BLYNK_RED);
+        DBlynk.logEvent("notification", "Warning: Fish Food Low!");
+        gusIsSend_Noti_Bef = 1;
+      }
+    } else {
+      if(gusIsSend_Noti_Bef == 1) {
+        DBlynk.setProperty(V_FOOD_LEVEL, "color", BLYNK_GREEN);
+        gusIsSend_Noti_Bef = 0;
+      }
+    }
+    gulStart_LCD_Timer = millis();
+  }
+}
+
+// ==========================================
+// ULTRASONIC FUEL GAUGE LOGIC
+// ==========================================
+int iGet_Food_Level() 
+{
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); 
+  if (duration == 0) return 0; 
+  
+  int distance_cm = duration * 0.034 / 2;
+  int distanceEmpty = 15; // cm from sensor to bottom
+  int distanceFull = 3;   // cm from sensor to top
+  
+  int percentage = map(distance_cm, distanceEmpty, distanceFull, 0, 100);
+  percentage = constrain(percentage, 0, 100); 
+  return percentage;
+}
+
+// ==========================================
+// AUTOMATED APP/TIMER FUNCTION
+// ==========================================
+void vSmartFeed(unsigned short usDropTime, bool bStartedByApp)
+{
+  gbIsJammed = false; 
+  bool bFoodDropped = false;
+  unsigned long ulStart = millis();
+  
+  vMotor_Control(ON);
+  
+  while(millis() - ulStart < usDropTime) {
+    DBlynk.run(); 
+    if(bStartedByApp && DBlynk.read_asInt(V_FEEDER_CONTROL) == 0) {
+      vMotor_Control(OFF); return; 
+    }
+    if(usRead_IR_Sensor() == 1) bFoodDropped = true; 
+    delay(10); 
+  }
+  vMotor_Control(OFF);
+
+  byte byRetries = 0;
+  while(bFoodDropped == false && byRetries < 5) 
+  {
+    DBlynk.logEvent("notification", "Jam Detected! Trying to unstick...");
+    lcd.clear(); lcd.setCursor(0,0); lcd.print("JAM DETECTED!");
+    lcd.setCursor(0,1); lcd.print("Unsticking...");
+    
+    tone(BUZZER, 1000, 300); 
+    
+    // Spin Backwards 
+    feederServo.attach(SERVO_PIN); 
+    feederServo.write(0);
+    unsigned long reverseStart = millis();
+    while(millis() - reverseStart < 500) {
+      DBlynk.run();
+      if(bStartedByApp && DBlynk.read_asInt(V_FEEDER_CONTROL) == 0) {
+        vMotor_Control(OFF); return; 
+      }
+      delay(10);
+    }
+    
+    // Spin Forwards
+    feederServo.write(180);
+    unsigned long ulRetryTimer = millis();
+    while(millis() - ulRetryTimer < 1000) {
+      DBlynk.run();
+      if(bStartedByApp && DBlynk.read_asInt(V_FEEDER_CONTROL) == 0) {
+        vMotor_Control(OFF); return; 
+      }
+      if(usRead_IR_Sensor() == 1) bFoodDropped = true; 
+      delay(10);
+    }
+    vMotor_Control(OFF);
+    byRetries++;
+  }
+
+  if (bFoodDropped == false) {
+    gbIsJammed = true;
+    DBlynk.logEvent("notification", "CRITICAL: Feeder is permanently stuck!");
+  }
+}
+
+// <--- Screen Formatting --->
+void vLCD_Disp_Set_Time(long lSetHour, long lSetMin, 
+                        unsigned long lHour, unsigned long lMin, unsigned long lSecond,
+                        int foodPct)
+{
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  if(lSetHour >= 0 && lSetMin >= 0) {
+    lcd.print("T:"); lcd.print(lSetHour); lcd.print(":"); lcd.print(lSetMin);
+  } else {
+    lcd.print("T:OFF");
+  }
+
+  lcd.setCursor(9, 0); 
+  lcd.print("Fd:"); lcd.print(foodPct); lcd.print("%");
+
+  lcd.setCursor(0,1);
+  lcd.print(" -- "); lcd.print(lHour); lcd.print(":"); 
+  lcd.print(lMin); lcd.print(":"); lcd.print(lSecond); lcd.print(" -- ");
+}
+
+void secondsToHMS(long seconds, long &h, long &m, long &s )
+{
+    uint32_t t = seconds;
+    s = t % 60; t = (t - s)/60;
+    m = t % 60; t = (t - m)/60;
+    h = t;
+}
+
+unsigned short usRead_IR_Sensor(void)
+{
+  if(digitalRead(IR_SENSOR_PIN) == LOW) return 1;
+  else return 0;
+}
+
+// Detach Fix to prevent Jitter
+void vMotor_Control(short sOnOff)
+{
+  if(sOnOff == ON) {
+    feederServo.attach(SERVO_PIN); 
+    feederServo.write(180);        
+  } else {
+    feederServo.writeMicroseconds(1500); 
+    delay(50);                           
+    feederServo.detach();                
+  }
+}
